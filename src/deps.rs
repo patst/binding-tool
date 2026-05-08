@@ -88,7 +88,7 @@ pub(super) fn parse_buildpack_toml_from_disk(path: &path::Path) -> Result<Vec<De
 
     File::open(path)
         .and_then(|mut f| f.read_to_string(&mut input))
-        .unwrap();
+        .with_context(|| format!("cannot read {path:?}"))?;
 
     transform(toml::from_str(&input)?)
 }
@@ -132,32 +132,54 @@ pub(super) fn download_dependencies(
     let binding_path = Arc::new(binding_path);
     let deps = Arc::new(Mutex::new(deps));
 
-    let mut join_handles: Vec<JoinHandle<_>> = vec![];
+    let mut join_handles: Vec<JoinHandle<Result<()>>> = vec![];
 
     for _i in 0..max_simult {
         let agent = Arc::clone(&agent);
         let binding_path = Arc::clone(&binding_path);
         let deps = Arc::clone(&deps);
 
-        join_handles.push(thread::spawn(move || {
-            while let Some(d) = deps.lock().expect("unable to get lock").pop() {
-                match d.download(&agent, &binding_path) {
-                    Ok(_) => (),
-                    Err(err) => panic!("Download of {} failed with error {}", d.uri, err),
+        join_handles.push(thread::spawn(move || -> Result<()> {
+            loop {
+                let d = {
+                    let mut guard = deps
+                        .lock()
+                        .map_err(|_| anyhow!("download thread mutex was poisoned"))?;
+                    guard.pop()
+                };
+                match d {
+                    Some(dep) => dep
+                        .download(&agent, &binding_path)
+                        .with_context(|| format!("download of {} failed", dep.uri))?,
+                    None => break,
                 }
             }
+            Ok(())
         }))
     }
 
+    let mut first_error: Option<anyhow::Error> = None;
     for handle in join_handles {
-        if let Err(err) = handle.join()
-            && let Ok(msg) = err.downcast::<String>()
-        {
-            return Err(anyhow!("thread panic: {}", msg));
+        match handle.join() {
+            Ok(Ok(())) => (),
+            Ok(Err(e)) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+            Err(_) => {
+                if first_error.is_none() {
+                    first_error = Some(anyhow!("a download thread panicked unexpectedly"));
+                }
+            }
         }
     }
 
-    Ok(())
+    if let Some(err) = first_error {
+        Err(err)
+    } else {
+        Ok(())
+    }
 }
 
 fn configure_agent() -> Result<ureq::Agent> {
